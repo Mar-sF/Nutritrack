@@ -1142,8 +1142,8 @@ const DEF={kcal:2470,prot:185,carb:250,fat:82,water:3300};
 const CATS={viande:"Viande",poisson:"Poisson",vegetal:"Légume",feculents:"Féculent",laitier:"Laitier",fruits:"Fruit",legumineuses:"Légumineuse",noix:"Noix",sport:"Sport",autre:"Autre"};
 
 let curD=todayK(), selF=null, selM=null, customs=[], goals={...DEF}, log={}, dbCat=null;
-let scanStream=null, scanInterval=null;
-let zxing=null;
+let scanControls=null, codeReader=null;
+let zxing=null, scanDone=false;
 
 /* ── UTILS ── */
 function todayK(){const d=new Date();return pd(d.getFullYear())+'-'+pd(d.getMonth()+1)+'-'+pd(d.getDate())}
@@ -1440,80 +1440,88 @@ function confirmAdd(){
 
 /* ══════════════════════════════════════════════
    SCANNER — CAMÉRA MOBILE
-   Utilise getUserMedia + détection manuelle ZXing
+   Utilise ZXing decodeFromConstraints (boucle interne)
 ══════════════════════════════════════════════ */
 function openScanner(){
+  scanDone=false;
   document.getElementById('scanner-fs').classList.add('open');
   startScan();
 }
 
 async function startScan(){
-  const video=document.getElementById('scan-video');
   const status=document.getElementById('scan-status');
-  status.textContent='Démarrage de la caméra…';
+  const video=document.getElementById('scan-video');
+  status.textContent='Chargement du scanner…';
 
-  // Stop previous stream
-  if(scanStream){scanStream.getTracks().forEach(t=>t.stop());scanStream=null}
-  if(scanInterval){clearInterval(scanInterval);scanInterval=null}
+  // Nettoyage préalable
+  _killScan();
 
   try{
-    // Request rear camera — essential for mobile
-    const constraints={
-      video:{
-        facingMode:{ideal:'environment'},
-        width:{ideal:1280},height:{ideal:720}
-      }
-    };
-    scanStream=await navigator.mediaDevices.getUserMedia(constraints);
-    video.srcObject=scanStream;
-    await video.play();
-    status.textContent='📷 Pointez vers un code-barres…';
+    // 1. Charger ZXing si pas encore fait
+    if(!zxing) await loadZXing();
 
-    // Load ZXing lazily
-    if(!zxing){
-      try{
-        await loadZXing();
-      }catch(e){
-        status.textContent='⚠️ Scanner non disponible. Utilisez la saisie manuelle.';
-        return;
-      }
-    }
+    // 2. ZXing gère lui-même la caméra + la boucle de décodage
+    //    decodeFromConstraints = getUserMedia + decode en continu, callbacks à chaque frame
+    codeReader=new zxing.BrowserMultiFormatReader();
 
-    // Scan loop using canvas
-    const canvas=document.createElement('canvas');
-    const ctx=canvas.getContext('2d');
-    const reader=new zxing.BrowserMultiFormatReader();
+    const hints=new Map();
+    // Activer tous les formats courants (EAN-13 supermarché + QR + DataMatrix)
+    hints.set(zxing.DecodeHintType.TRY_HARDER, true);
+    hints.set(zxing.DecodeHintType.POSSIBLE_FORMATS, [
+      zxing.BarcodeFormat.EAN_13,
+      zxing.BarcodeFormat.EAN_8,
+      zxing.BarcodeFormat.UPC_A,
+      zxing.BarcodeFormat.UPC_E,
+      zxing.BarcodeFormat.CODE_128,
+      zxing.BarcodeFormat.CODE_39,
+      zxing.BarcodeFormat.QR_CODE,
+      zxing.BarcodeFormat.DATA_MATRIX,
+    ]);
+    codeReader=new zxing.BrowserMultiFormatReader(hints);
 
-    scanInterval=setInterval(async()=>{
-      if(!video.videoWidth||!scanStream)return;
-      canvas.width=video.videoWidth;
-      canvas.height=video.videoHeight;
-      ctx.drawImage(video,0,0);
-      try{
-        const result=reader.decodeFromCanvas(canvas);
+    status.textContent='📷 Pointez vers le code-barres…';
+
+    // 3. decodeFromConstraints démarre getUserMedia + decode loop
+    //    Le callback reçoit (result, error, controls)
+    //    result = null si pas de code détecté sur cette frame (normal)
+    await codeReader.decodeFromConstraints(
+      {video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}},
+      video,
+      async (result, err, controls)=>{
+        if(scanDone) return; // évite les appels multiples
         if(result){
+          scanDone=true;
+          scanControls=controls;
+          controls.stop(); // arrêt immédiat de la boucle
+
           const code=result.getText();
-          // Flash success
+
+          // Feedback visuel + haptique
           const succ=document.getElementById('scan-success');
           succ.classList.add('show');
-          setTimeout(()=>succ.classList.remove('show'),600);
-          // Vibrate if available
-          if(navigator.vibrate)navigator.vibrate(100);
-          status.textContent='✅ Code : '+code+' — Recherche…';
-          stopScan();
-          await fetchBarcode(code);
+          setTimeout(()=>succ.classList.remove('show'),700);
+          if(navigator.vibrate) navigator.vibrate([80,40,80]);
+
+          status.textContent='✅ Détecté : '+code;
+
+          setTimeout(async()=>{
+            stopScan();
+            await fetchBarcode(code);
+          },600);
         }
-      }catch(e){/* no result yet, continue */}
-    },300);
+        // err = "no QR code found" à chaque frame sans code — c'est normal, on ignore
+      }
+    );
 
   }catch(e){
-    if(e.name==='NotAllowedError'){
-      status.textContent='❌ Accès caméra refusé. Autorisez la caméra dans les réglages du navigateur.';
-    }else if(e.name==='NotFoundError'){
-      status.textContent='❌ Aucune caméra trouvée sur cet appareil.';
-    }else{
-      status.textContent='❌ Erreur : '+e.message;
-    }
+    const msg=e.name==='NotAllowedError'
+      ? '❌ Caméra refusée — autorisez l\'accès dans les réglages du navigateur'
+      : e.name==='NotFoundError'
+      ? '❌ Aucune caméra détectée'
+      : e.name==='NotReadableError'
+      ? '❌ Caméra utilisée par une autre app'
+      : '❌ '+e.message;
+    status.textContent=msg;
   }
 }
 
@@ -1521,19 +1529,36 @@ function loadZXing(){
   return new Promise((resolve,reject)=>{
     if(window.ZXing){zxing=window.ZXing;resolve();return}
     const s=document.createElement('script');
-    s.src='https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
-    s.onload=()=>{if(window.ZXing){zxing=window.ZXing;resolve()}else reject(new Error('ZXing not found'))};
-    s.onerror=()=>reject(new Error('ZXing load failed'));
+    // Version 0.18.6 — plus stable sur mobile que 0.21
+    s.src='https://cdn.jsdelivr.net/npm/@zxing/library@0.18.6/umd/index.min.js';
+    s.onload=()=>{
+      if(window.ZXing){zxing=window.ZXing;resolve()}
+      else reject(new Error('ZXing introuvable'));
+    };
+    s.onerror=()=>{
+      // Fallback sur unpkg
+      const s2=document.createElement('script');
+      s2.src='https://unpkg.com/@zxing/library@0.18.6/umd/index.min.js';
+      s2.onload=()=>{zxing=window.ZXing;resolve()};
+      s2.onerror=()=>reject(new Error('Impossible de charger ZXing'));
+      document.head.appendChild(s2);
+    };
     document.head.appendChild(s);
   });
 }
 
+function _killScan(){
+  // Arrêt propre de tout ce qui tourne
+  if(scanControls){try{scanControls.stop()}catch(e){}scanControls=null}
+  if(codeReader){try{codeReader.reset()}catch(e){}codeReader=null}
+  const v=document.getElementById('scan-video');
+  if(v&&v.srcObject){v.srcObject.getTracks().forEach(t=>t.stop());v.srcObject=null}
+}
+
 function stopScan(){
-  if(scanStream){scanStream.getTracks().forEach(t=>t.stop());scanStream=null}
-  if(scanInterval){clearInterval(scanInterval);scanInterval=null}
+  _killScan();
   document.getElementById('scanner-fs').classList.remove('open');
-  const video=document.getElementById('scan-video');
-  video.srcObject=null;
+  document.getElementById('scan-status').textContent='';
 }
 
 async function fetchBarcode(barcode){
